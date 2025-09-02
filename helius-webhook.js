@@ -1,4 +1,4 @@
-// helius-webhook.js —— 从 wallets.json 读取地址（热更新）+ 北京时间 + TG 队列限速 + 金额区间 + 新钱包判定
+// helius-webhook.js —— wallets.json 热更 + 北京时区 + TG 队列限速 + 金额区间 + 首次收款判定（双重校验）
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env'), override: true });
 const fs = require('fs');
@@ -24,14 +24,14 @@ const TG_SOL_MIN = parseNum(process.env.TG_SOL_MIN, -Infinity);
 const TG_SOL_MAX = parseNum(process.env.TG_SOL_MAX,  Infinity);
 console.log(`[TG筛选] 仅在 ${Number.isFinite(TG_SOL_MIN)?TG_SOL_MIN:'-∞'} ~ ${Number.isFinite(TG_SOL_MAX)?TG_SOL_MAX:'∞'} SOL 之间时推送`);
 
-/* ========== Solana RPC（用于判定“新钱包”） ========== */
+/* ========== Solana RPC（用于判定“首次收 SOL”） ========== */
 // 不配则用官方公共节点；建议配置自己或供应商的 RPC，稳定性更好
 const SOLANA_RPC = (process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com').trim();
 
-// ① 阈值常量
-const NEW_WALLET_MAX_TXS = Number.isFinite(Number(process.env.NEW_WALLET_MAX_TXS))? Number(process.env.NEW_WALLET_MAX_TXS) : 1;  // 默认阈值：≤1 笔算新
+/* ========== 是否启用“首次收款判定” ========== */
+// CHECK_NEW_WALLET=1 开启；=0 关闭（默认关闭）
 const CHECK_NEW_WALLET = Number(process.env.CHECK_NEW_WALLET) === 1;
-console.log(`[新钱包判定] ${CHECK_NEW_WALLET ? '开启(=1)' : '关闭(=0)'}`);
+console.log(`[首次收款判定] ${CHECK_NEW_WALLET ? '开启(=1)' : '关闭(=0)'}`);
 
 /* ========== fetch ========== */
 const fetchFn = (typeof fetch === 'function')
@@ -106,9 +106,14 @@ async function tgPump() {
 
 /* ========== 工具 ========== */
 const lamportsToSOL = (n) => Number(n) / 1e9;
-const seen = new Set();
+const fmtSol = (x) => Number(x).toFixed(6).replace(/\.?0+$/,''); // 展示更友好
+
+const seen = new Set(); // 去重：sig:from:to:amount
 const dedupKey = (sig, from, to, amount) => `${sig}:${from}:${to}:${amount}`;
-function remember(k){ seen.add(k); if (seen.size > 5000){ let i=0; for(const x of seen){ seen.delete(x); if(++i>1000) break; } } }
+function remember(k){
+  seen.add(k);
+  if (seen.size > 5000){ let i=0; for(const x of seen){ seen.delete(x); if(++i>1000) break; } }
+}
 
 /* ========== 时间格式：北京时间（UTC+8） ========== */
 function fmtBeijing(tsSec) {
@@ -129,11 +134,63 @@ function fmtBeijing(tsSec) {
   }
 }
 
-/* ========== 判定“新钱包”（≤1 笔交易，包括当前这笔） ========== */
+/* ========== “本笔交易首次收 SOL + 历史签名 < 2” 双重判定 ========== */
+// A. 交易内首次收款：preBalance===0 且 postBalance>0
+// 为减少重复 RPC：sig+addr 级别缓存
+const firstRecvMemo = new Set();
+function memoAdd(k){
+  firstRecvMemo.add(k);
+  if (firstRecvMemo.size > 5000){ let i=0; for(const x of firstRecvMemo){ firstRecvMemo.delete(x); if(++i>1000) break; } }
+}
+
+async function isFirstReceiveInThisTx(signature, address) {
+  const memoKey = `${signature}:${address}`;
+  if (firstRecvMemo.has(memoKey)) return true;
+
+  try {
+    const body = {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getTransaction',
+      params: [
+        signature,
+        { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }
+      ]
+    };
+    const res  = await fetchFn(SOLANA_RPC, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    const tx   = data?.result;
+    if (!tx) return false;
+
+    // 兼容两种返回格式：字符串或 { pubkey }
+    const keys = tx.transaction.message.accountKeys.map(k => typeof k === 'string' ? k : k.pubkey);
+    const i    = keys.indexOf(address);
+    if (i === -1) return false;
+
+    const pre  = tx.meta?.preBalances?.[i];
+    const post = tx.meta?.postBalances?.[i];
+    if (typeof pre !== 'number' || typeof post !== 'number') return false;
+
+    if (pre === 0 && post > 0) {
+      memoAdd(memoKey);
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.log(`⚠️ getTransaction 失败：${signature} -> ${e?.message || e}`);
+    return false;
+  }
+}
+
+// B. 历史签名计数：返回至多 limit 条，取长度
 const sigCountCache = new Map(); // addr -> { ts, count, limit }
 const SIG_CACHE_TTL = 60 * 1000;
 
-async function getSigCountUpTo(address, limit = NEW_WALLET_MAX_TXS + 1) {
+async function getSigCountUpTo(address, limit = 2) {
   const c = sigCountCache.get(address);
   if (c && Date.now() - c.ts < SIG_CACHE_TTL && c.limit >= limit) {
     return Math.min(c.count, limit);
@@ -151,22 +208,14 @@ async function getSigCountUpTo(address, limit = NEW_WALLET_MAX_TXS + 1) {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
   });
   const data = await res.json();
-  if (data.error) throw new Error(`RPC error: ${JSON.stringify(data.error)}`);
+  if (data.error) {
+    console.log('⚠️ getSignaturesForAddress 错误：', JSON.stringify(data.error));
+    return limit; // 保守：当作“>=limit”，避免误报
+  }
   const list = Array.isArray(data.result) ? data.result : [];
   const count = list.length;
   sigCountCache.set(address, { ts: Date.now(), count, limit });
   return count;
-}
-
-// <=1（含当前交易）视为“新钱包”；>=2 视为“老钱包”
-async function isNewWallet(address) {
-  try {
-    const cnt = await getSigCountUpTo(address, NEW_WALLET_MAX_TXS + 1);
-    return cnt <= NEW_WALLET_MAX_TXS;
-  } catch (e) {
-    console.log(`⚠️ RPC 查询失败，按“非新钱包”处理：${address} -> ${e?.message || e}`);
-    return false;
-  }
 }
 
 /* ========== wallets.json 读取 & 热更新（仅此来源） ========== */
@@ -236,49 +285,48 @@ app.post('/helius', async (req, res) => {
       const key = dedupKey(sig, from, to, lamports);
       if (seen.has(key)) continue; remember(key);
 
-      // 仅 watch 列表内地址；为空则忽略
+      // 只在“发送方在 watch 列表”时考虑
       const watchFrom = WATCH_ADDRS.has(from);
-      const watchTo   = WATCH_ADDRS.has(to);
-      if (WATCH_ADDRS.size === 0 || !(watchFrom || watchTo)) continue;
+      const watchTo   = WATCH_ADDRS.has(to); // 仅用于显示“内部转”
+      if (WATCH_ADDRS.size === 0 || !watchFrom) continue;
 
+      // 金额区间过滤
       const sol = lamportsToSOL(lamports);
-      const inRange = (sol >= TG_SOL_MIN) && (sol <= TG_SOL_MAX);
-      if (!inRange) {
+      if (!(sol >= TG_SOL_MIN && sol <= TG_SOL_MAX)) {
         console.log(`(skip TG) 金额 ${sol} 不在区间 ${TG_SOL_MIN}~${TG_SOL_MAX} SOL`);
         continue;
       }
 
-      // 判定方向
-      const dir = watchTo && !watchFrom ? '🟢 收到'
-               : watchFrom && !watchTo ? '🔴 发送'
-               : '↔️ 内部转';
+      // 方向（此时 watchFrom 一定为 true）
+      const dir = watchTo ? '↔️ 内部转' : '🔴 发送';
 
-      // ====== 新增：根据开关决定是否判定“新钱包” ======
+      // 可选：仅当开启时，做“双重判定”（本笔首次收款 + 历史签名 < 2）
+      let badge = '';
       if (CHECK_NEW_WALLET) {
-        // 仍按“只看收款地址”判新（与你之前一致）
-        const candidates = watchTo ? [to] : [];
-      
-        let anyNew = false;
-        for (const addr of candidates) {
-          if (await isNewWallet(addr)) { anyNew = true; break; }
+        const first = await isFirstReceiveInThisTx(sig, to);
+        if (!first) {
+          console.log(`(skip TG) 不是本笔交易的首次收 SOL：${to}`);
+          continue;
         }
-        if (!anyNew) {
-          console.log(`(skip TG) 非新钱包（两笔及以上）：${candidates.join(', ')}`);
-          continue; // 不发 TG
+        const cnt = await getSigCountUpTo(to, 2);
+        if (cnt >= 2) {
+          console.log(`(skip TG) 历史签名>=2：${to} count=${cnt}`);
+          continue;
         }
+        badge = '（新钱包）';
       }
 
       const fl = LABELS.get(from) ? `(${LABELS.get(from)})` : '';
       const tl = LABELS.get(to)   ? `(${LABELS.get(to)})`   : '';
 
       const text =
-`🔔 SOL 转账（新钱包）
+`🔔 SOL 转账${badge}
 slot <b>${slot}</b>  time <b>${ts} 北京时间</b>
 from <code>${from}</code> ${fl}
 to   <code>${to}</code> ${tl}
-${dir} <b>${sol}</b> SOL`;
+${dir} <b>${fmtSol(sol)}</b> SOL`;
 
-      console.log(`[SOL][NEW] slot=${slot} sig=${sig} ${from}${fl} -> ${to}${tl} ${sol} SOL`);
+      console.log(`[SOL] slot=${slot} sig=${sig} ${from}${fl} -> ${to}${tl} ${fmtSol(sol)} SOL`);
       enqueueTg(text, sig);
     }
   }
